@@ -241,6 +241,31 @@ def parse_worktree_list(output: bytes) -> list[Worktree]:
     return records
 
 
+def parse_gitlink_paths(output: bytes) -> list[str]:
+    """Parse NUL-delimited ``git ls-files --stage`` gitlink records."""
+    paths: list[str] = []
+    seen: set[str] = set()
+    for record in output.split(b"\0"):
+        if not record:
+            continue
+        metadata, separator, raw_path = record.partition(b"\t")
+        fields = metadata.split(b" ")
+        if separator != b"\t" or len(fields) != 3 or not raw_path:
+            raise GitUpError("Git returned an invalid staged-file record.")
+        if fields[0] not in {b"100644", b"100755", b"120000", b"160000"}:
+            raise GitUpError("Git returned an invalid staged-file mode.")
+        if not re.fullmatch(rb"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", fields[1]):
+            raise GitUpError("Git returned an invalid staged-file object ID.")
+        if fields[2] not in {b"0", b"1", b"2", b"3"}:
+            raise GitUpError("Git returned an invalid staged-file stage.")
+        if fields[0] == b"160000":
+            path = _decode(raw_path)
+            if path not in seen:
+                paths.append(path)
+                seen.add(path)
+    return paths
+
+
 def default_branch_from_ls_remote(output: bytes) -> str:
     """Extract the remote's symbolic HEAD target from ``ls-remote`` output."""
     for raw_line in output.splitlines():
@@ -479,16 +504,48 @@ class GitUp:
         return value
 
     def _is_dirty(self, cwd: Path, *, include_ignored: bool) -> bool:
+        if include_ignored:
+            return self._is_dirty_recursively(cwd)
+        result = self._run_git(
+            [
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+                "--ignore-submodules=none",
+            ],
+            cwd=cwd,
+        )
+        return bool(result.stdout)
+
+    def _is_dirty_recursively(self, cwd: Path) -> bool:
         args = [
             "status",
             "--porcelain=v1",
             "--untracked-files=all",
             "--ignore-submodules=none",
+            "--ignored=matching",
+            "-z",
         ]
-        if include_ignored:
-            args.append("--ignored=matching")
         result = self._run_git(args, cwd=cwd)
-        return bool(result.stdout)
+        dirty = bool(result.stdout)
+        for relative_path in self._initialized_submodules(cwd):
+            if self._is_dirty_recursively(cwd / relative_path):
+                dirty = True
+        return dirty
+
+    def _initialized_submodules(self, cwd: Path) -> list[str]:
+        result = self._run_git(["ls-files", "--stage", "-z"], cwd=cwd)
+        paths = parse_gitlink_paths(result.stdout)
+        initialized: list[str] = []
+        for relative_path in paths:
+            submodule = cwd / relative_path
+            if not submodule.exists() or not os.path.lexists(submodule / ".git"):
+                continue
+            git_dir = self._run_git(["rev-parse", "--git-dir"], cwd=submodule)
+            if not _text(git_dir.stdout):
+                raise GitUpError(f"Git returned no git directory for {submodule}")
+            initialized.append(relative_path)
+        return initialized
 
     def _is_ancestor(self, ancestor: str, descendant: str, cwd: Path) -> bool:
         result = self._run_git(

@@ -12,6 +12,7 @@ from git_up.core import (
     Worktree,
     classify_worktree,
     default_branch_from_ls_remote,
+    parse_gitlink_paths,
     parse_worktree_list,
 )
 
@@ -23,12 +24,19 @@ class FakeGit:
         dirty_primary: bool = False,
         fail_prefix: tuple[str, ...] | None = None,
         ignored_candidate: bool = False,
+        initialized_submodule: bool = False,
+        dirty_submodule: bool = False,
+        candidate_path: Path = Path("/repo-wt"),
         change_on_final_recheck: bool = False,
     ) -> None:
         self.calls: list[tuple[tuple[str, ...], Path | None, bool, bool]] = []
         self.dirty_primary = dirty_primary
         self.fail_prefix = fail_prefix
         self.ignored_candidate = ignored_candidate
+        self.initialized_submodule = initialized_submodule
+        self.dirty_submodule = dirty_submodule
+        self.candidate_path = candidate_path
+        self.submodule_path = candidate_path / "vendor/submodule"
         self.change_on_final_recheck = change_on_final_recheck
         self.worktree_lists = 0
         self.removed = False
@@ -88,8 +96,25 @@ class FakeGit:
             return result(
                 b" M file\n" if self.dirty_primary and cwd == Path("/repo") else b""
             )
-        if command[-1:] == ("--ignored=matching",) and self.ignored_candidate:
-            return result(b"!! cache/\n")
+        if command == (
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            "--ignore-submodules=none",
+            "--ignored=matching",
+            "-z",
+        ):
+            if self.dirty_submodule and cwd == self.submodule_path:
+                return result(b"!! ignored-inside-submodule.txt\0")
+            if self.ignored_candidate and cwd == self.candidate_path:
+                return result(b"!! cache/\0")
+            return result(b"")
+        if command == ("ls-files", "--stage", "-z"):
+            if self.initialized_submodule and cwd == self.candidate_path:
+                return result(b"160000 " + SHA_A.encode() + b" 0\tvendor/submodule\0")
+            return result(b"")
+        if command == ("rev-parse", "--git-dir") and cwd == self.submodule_path:
+            return result(b".git\n")
         if command == ("rev-parse", "--verify", "refs/remotes/origin/trunk^{commit}"):
             return result((SHA_B + "\n").encode())
         if command == ("rev-parse", "--verify", "HEAD^{commit}"):
@@ -158,6 +183,17 @@ def test_parse_nul_delimited_worktree_preserves_literal_newlines() -> None:
 
     assert worktrees[0].path == Path("/repo/line\n")
     assert worktrees[1].lock_reason == "reason ending in newline\n"
+
+
+def test_parse_gitlink_paths_preserves_literal_path_bytes() -> None:
+    output = b"160000 " + SHA_A.encode() + b" 0\tvendor/with\tliteral\nname\0"
+
+    assert parse_gitlink_paths(output) == ["vendor/with\tliteral\nname"]
+
+
+def test_parse_gitlink_paths_rejects_malformed_records() -> None:
+    with pytest.raises(GitUpError, match="staged-file"):
+        parse_gitlink_paths(b"not a staged-file record\0")
 
 
 def test_default_branch_is_read_from_symref_not_main_or_master() -> None:
@@ -286,6 +322,73 @@ def test_ignored_content_is_dirty_for_removal_preflight() -> None:
 
     assert updater._is_dirty(Path("/repo-wt"), include_ignored=True)
     assert not updater._is_dirty(Path("/repo-wt"), include_ignored=False)
+
+
+def test_recursive_dirty_inspection_checks_initialized_submodule_status(
+    tmp_path: Path,
+) -> None:
+    candidate_path = tmp_path / "candidate"
+    fake = FakeGit(
+        initialized_submodule=True,
+        dirty_submodule=True,
+        candidate_path=candidate_path,
+    )
+    fake.submodule_path.mkdir(parents=True)
+    fake.submodule_path.joinpath(".git").write_text("gitdir: /fake\n")
+    updater = GitUp(git=fake, cwd=Path("/repo"))
+
+    assert updater._is_dirty(candidate_path, include_ignored=True)
+    assert (
+        (
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            "--ignore-submodules=none",
+            "--ignored=matching",
+            "-z",
+        ),
+        fake.submodule_path,
+        True,
+        False,
+    ) in fake.calls
+
+
+def test_recursive_submodule_inspection_failure_retains_candidate() -> None:
+    fake = FakeGit(fail_prefix=("ls-files", "--stage", "-z"))
+    output = StringIO()
+
+    code = GitUp(git=fake, cwd=Path("/repo"), stdout=output).run()
+
+    assert code == 0
+    assert not any(command[:2] == ("worktree", "remove") for command, *_ in fake.calls)
+    assert "Retained worktree /repo-wt: uninspectable." in output.getvalue()
+
+
+def test_final_candidate_preflight_precedes_first_worktree_removal() -> None:
+    fake = FakeGit()
+
+    assert GitUp(git=fake, cwd=Path("/repo")).run() == 0
+
+    candidate_status = (
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+        "--ignore-submodules=none",
+        "--ignored=matching",
+        "-z",
+    )
+    final_status_index = max(
+        index
+        for index, (command, cwd, *_rest) in enumerate(fake.calls)
+        if command == candidate_status and cwd == Path("/repo-wt")
+    )
+    first_remove_index = next(
+        index
+        for index, (command, *_rest) in enumerate(fake.calls)
+        if command[:2] == ("worktree", "remove")
+    )
+
+    assert final_status_index < first_remove_index
 
 
 def test_final_recheck_retains_worktree_changed_after_preflight() -> None:
