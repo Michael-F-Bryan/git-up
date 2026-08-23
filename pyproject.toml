@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "mfb-git-up"
 version = "0.1.0"
-description = "A future Git workflow helper"
+description = "A safe Git extension for fast-forwarding and cleaning up worktrees"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]

@@ -9,6 +9,7 @@ permissions:
   issues: write
   pull-requests: write
 
+# Operator note: repository policy must allow Actions-created PRs; generated Release Please PR CI may need approval. Verify remotely once a repository exists.
 jobs:
   release-please:
     runs-on: ubuntu-latest

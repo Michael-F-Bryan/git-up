@@ -20,6 +20,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
       - name: Set up uv
         uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
@@ -43,6 +45,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
       - name: Set up uv
         uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
@@ -61,13 +65,13 @@ jobs:
           set -euo pipefail
           export PATH="$(uv tool dir --bin):$PATH"
           command -v git-up
+          git-up --help
+          git-up --version
           temporary_repository="$(mktemp -d)"
           trap 'rm -rf "$temporary_repository"' EXIT
           git -C "$temporary_repository" init
           git -C "$temporary_repository" config user.name "CI"
           git -C "$temporary_repository" config user.email "ci@example.invalid"
           cd "$temporary_repository"
-          # Git reserves --help for manual lookup; -h dispatches extension help.
-          git up --help || test "$?" -eq 1
           git up -h
           git up --version
