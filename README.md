@@ -46,7 +46,10 @@ git up
 ## Install
 
 ```console
-uv tool install .
+uv tool install git+https://github.com/Michael-F-Bryan/git-up.git
+```
+
+```console
 git up -h
 git up --version
 ```
