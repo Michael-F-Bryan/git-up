@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import shutil
 
-from conftest import GitRepository, GitSandbox
+import pytest
+from conftest import GitRepository, GitSandbox, snapshot_repository
 
 
 def _remote_with_primary(
@@ -42,6 +43,71 @@ def test_fetch_failure_prevents_worktree_and_branch_cleanup(
     assert "fetch-failure-stale" in repository.worktree_porcelain()
 
 
+@pytest.mark.parametrize(
+    ("dirty_name", "dirty_content"),
+    [
+        ("tracked-primary-dirt", "tracked primary bytes\n"),
+        ("untracked-primary-dirt", "untracked primary bytes\n"),
+    ],
+)
+def test_dirty_primary_dispatch_fails_before_any_mutation(
+    git_sandbox: GitSandbox,
+    dirty_name: str,
+    dirty_content: str,
+) -> None:
+    repository, _remote = _remote_with_primary(git_sandbox)
+    repository.run("fetch", "origin")
+    repository.git_dir().joinpath("ORIG_HEAD").write_bytes(b"fixture ORIG_HEAD\n")
+    candidate = git_sandbox.linked_worktree(
+        repository, "primary-safety", "primary-safety"
+    )
+    stale = git_sandbox.linked_worktree(
+        repository, "primary-safety-stale", "primary-safety-stale"
+    )
+    stale_path = stale.path
+    shutil.rmtree(stale_path)
+    if dirty_name.startswith("tracked"):
+        repository.write("README.md", dirty_content)
+    else:
+        repository.write("untracked-primary.txt", dirty_content)
+
+    before = snapshot_repository(repository, candidates=[candidate, stale])
+    result = repository.git_up()
+    after = snapshot_repository(repository, candidates=[candidate, stale])
+
+    assert result.returncode != 0
+    assert before.fetch_head is not None
+    assert before.orig_head == b"fixture ORIG_HEAD\n"
+    assert after == before
+    assert repository.head() == before.head
+    assert candidate.path.exists()
+    assert "primary-safety" in repository.branch_names()
+    assert str(stale_path) in repository.worktree_porcelain()
+    assert "dirty" in result.output.lower()
+
+
+def test_ignored_only_primary_state_does_not_block_safe_update(
+    git_sandbox: GitSandbox,
+) -> None:
+    repository, remote = _remote_with_primary(git_sandbox)
+    repository.write(".gitignore", "primary-ignored.txt\n")
+    repository.commit("add primary ignore rule", relative_path=".gitignore")
+    repository.run("push", "origin", "HEAD:main")
+    repository.write("primary-ignored.txt", "preserve ignored primary bytes\n")
+    publisher = git_sandbox.clone(remote, "ignored-primary-publisher")
+    publisher.write("README.md", "safe update with ignored primary\n")
+    published_head = publisher.commit("advance remote with ignored primary")
+    publisher.run("push", "origin", "HEAD:main")
+
+    result = repository.git_up()
+
+    assert result.returncode == 0
+    assert repository.head() == published_head
+    assert repository.path.joinpath("primary-ignored.txt").read_text() == (
+        "preserve ignored primary bytes\n"
+    )
+
+
 def test_branch_is_retained_when_real_ref_lock_blocks_removal(
     git_sandbox: GitSandbox,
 ) -> None:
@@ -62,3 +128,79 @@ def test_branch_is_retained_when_real_ref_lock_blocks_removal(
         or not candidate.path.exists()
     )
     assert ref_lock.exists()
+
+
+def test_later_real_ref_failure_keeps_failed_ref_after_earlier_cleanup(
+    git_sandbox: GitSandbox,
+) -> None:
+    repository, _remote = _remote_with_primary(git_sandbox)
+    first = git_sandbox.linked_worktree(repository, "first-cleanup", "first-cleanup")
+    second = git_sandbox.linked_worktree(
+        repository, "second-ref-failure", "second-ref-failure"
+    )
+    ref_lock = repository.git_dir() / "refs/heads/second-ref-failure.lock"
+    ref_lock.parent.mkdir(parents=True, exist_ok=True)
+    ref_lock.write_bytes(b"held by another real Git operation\n")
+
+    result = repository.git_up()
+
+    assert result.returncode != 0
+    assert not first.path.exists()
+    assert "first-cleanup" not in repository.branch_names()
+    assert not second.path.exists()
+    assert "second-ref-failure" in repository.branch_names()
+    assert "second-ref-failure" not in repository.worktree_porcelain()
+    assert ref_lock.read_bytes() == b"held by another real Git operation\n"
+    assert "second-ref-failure" in result.output
+
+
+def test_preflight_invalid_candidate_prevents_earlier_cleanup(
+    git_sandbox: GitSandbox,
+) -> None:
+    repository, _remote = _remote_with_primary(git_sandbox)
+    first = git_sandbox.linked_worktree(
+        repository, "preflight-first", "preflight-first"
+    )
+    invalid = git_sandbox.linked_worktree(
+        repository, "preflight-invalid", "preflight-invalid"
+    )
+    git_link = invalid.path / ".git"
+    original_link = git_link.read_bytes()
+    git_link.write_bytes(b"gitdir: /preflight/path/does/not/exist\n")
+
+    try:
+        result = repository.git_up()
+    finally:
+        git_link.write_bytes(original_link)
+
+    assert result.returncode == 0
+    assert first.path.exists()
+    assert "preflight-first" in repository.branch_names()
+    assert invalid.path.exists()
+    assert "preflight-invalid" in repository.branch_names()
+    assert "preflight-invalid" in result.output
+
+
+def test_existing_cooperative_lock_blocks_mutation_but_not_dry_run(
+    git_sandbox: GitSandbox,
+) -> None:
+    repository, _remote = _remote_with_primary(git_sandbox)
+    candidate = git_sandbox.linked_worktree(
+        repository, "cooperative-lock", "cooperative-lock"
+    )
+    lock = repository.git_dir() / "git-up.lock"
+    lock.write_bytes(b"owned by another git up\n")
+
+    before = snapshot_repository(repository, candidates=[candidate])
+    dry_run = repository.git_up("--dry-run")
+    after_dry_run = snapshot_repository(repository, candidates=[candidate])
+    result = repository.git_up()
+    after = snapshot_repository(repository, candidates=[candidate])
+
+    assert dry_run.returncode == 0
+    assert after_dry_run == before
+    assert result.returncode != 0
+    assert after == before
+    assert lock.read_bytes() == b"owned by another git up\n"
+    assert candidate.path.exists()
+    assert "lock" in result.output.lower()

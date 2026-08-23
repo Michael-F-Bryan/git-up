@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
+import pytest
 from conftest import GitRepository, GitSandbox, remote_default
 
 
@@ -143,3 +145,27 @@ def test_path_with_spaces_is_handled_as_one_worktree_path(
     assert result.returncode == 0
     assert not candidate.path.exists()
     assert "spaced" not in repository.branch_names()
+
+
+def test_posix_worktree_path_ending_in_newline_is_preserved(
+    git_sandbox: GitSandbox,
+) -> None:
+    if os.name != "posix":
+        pytest.skip("newline worktree path contract is POSIX-only")
+    repository, _remote = _remote_with_primary(git_sandbox)
+    newline_name = "worktree-ending-in-newline\n"
+    try:
+        candidate = git_sandbox.linked_worktree(
+            repository, newline_name, "newline-path"
+        )
+    except AssertionError as error:
+        if "invalid" in str(error).lower() or "unsupported" in str(error).lower():
+            pytest.skip("this Git does not support a newline worktree path")
+        raise
+
+    result = repository.git_up()
+
+    assert result.returncode == 0
+    assert not candidate.path.exists()
+    assert "newline-path" not in repository.branch_names()
+    assert str(candidate.path) in result.output

@@ -102,6 +102,139 @@ class GitRepository:
         return git_dir if git_dir.is_absolute() else self.path / git_dir
 
 
+@dataclass(frozen=True)
+class RepositorySnapshot:
+    """The safety-critical state surfaces observed by integration tests."""
+
+    head: str
+    indices: tuple[tuple[str, bytes], ...]
+    status: str
+    files: tuple[tuple[str, bytes], ...]
+    refs: str
+    reflogs: tuple[tuple[str, bytes], ...]
+    config: bytes
+    fetch_head: bytes | None
+    orig_head: bytes | None
+    worktrees: str
+    lock_files: tuple[tuple[str, bytes], ...]
+    candidate_state: tuple[tuple[str, str | None, bool], ...]
+
+
+def _tree_files(root: Path) -> tuple[tuple[str, bytes], ...]:
+    """Capture checkout bytes while excluding internal Git object databases."""
+    if not root.exists():
+        return ()
+    files: list[tuple[str, bytes]] = []
+    for path in sorted(root.rglob("*")):
+        relative = path.relative_to(root)
+        if relative.parts and relative.parts[0] == ".git" and path.is_dir():
+            continue
+        if relative.parts and relative.parts[0] == ".git" and path.parent != root:
+            continue
+        if path.is_file():
+            files.append((str(relative), path.read_bytes()))
+    return tuple(files)
+
+
+def snapshot_repository(
+    repository: GitRepository,
+    *,
+    candidates: Iterable[GitRepository] = (),
+    additional_trees: Iterable[GitRepository] = (),
+) -> RepositorySnapshot:
+    """Capture Git metadata plus every byte in the requested checkout trees."""
+    git_dir = repository.git_dir()
+    candidate_list = tuple(candidates)
+    trees = (repository, *candidate_list, *tuple(additional_trees))
+    files = tuple(
+        sorted(
+            (
+                (f"{tree.path}:{relative}", content)
+                for tree in trees
+                for relative, content in _tree_files(tree.path)
+            ),
+            key=lambda item: item[0],
+        )
+    )
+    statuses = []
+    for tree in trees:
+        if not tree.path.exists():
+            statuses.append(f"{tree.path}\0")
+            continue
+        status = tree.run(
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            "--ignored=matching",
+            "--ignore-submodules=none",
+            extra_env={"GIT_OPTIONAL_LOCKS": "0"},
+        ).stdout
+        statuses.append(f"{tree.path}\0{status}")
+    status = "".join(statuses)
+    indices = []
+    for tree in trees:
+        if not tree.path.exists():
+            continue
+        index = tree.run(
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "index",
+            extra_env={"GIT_OPTIONAL_LOCKS": "0"},
+        ).stdout.strip()
+        indices.append((str(tree.path), Path(index).read_bytes()))
+
+    def byte_files(
+        directory: Path, suffix: str | None = None
+    ) -> tuple[tuple[str, bytes], ...]:
+        if not directory.exists():
+            return ()
+        return tuple(
+            (str(path.relative_to(directory)), path.read_bytes())
+            for path in sorted(directory.rglob("*"))
+            if path.is_file() and (suffix is None or path.name.endswith(suffix))
+        )
+
+    lock_files = byte_files(git_dir, ".lock")
+    reflogs = byte_files(git_dir / "logs")
+    candidate_state = tuple(
+        (
+            str(tree.path),
+            tree.current_branch() if tree.path.exists() else None,
+            tree.path.exists(),
+        )
+        for tree in candidate_list
+    )
+    return RepositorySnapshot(
+        head=repository.head(),
+        indices=tuple(indices),
+        status=status,
+        files=files,
+        refs=repository.run("show-ref").stdout,
+        reflogs=reflogs,
+        config=(git_dir / "config").read_bytes(),
+        fetch_head=(
+            (git_dir / "FETCH_HEAD").read_bytes()
+            if (git_dir / "FETCH_HEAD").exists()
+            else None
+        ),
+        orig_head=(
+            (git_dir / "ORIG_HEAD").read_bytes()
+            if (git_dir / "ORIG_HEAD").exists()
+            else None
+        ),
+        worktrees=repository.run(
+            "worktree",
+            "list",
+            "--porcelain",
+            "-z",
+            extra_env={"GIT_OPTIONAL_LOCKS": "0"},
+        ).stdout,
+        lock_files=lock_files,
+        candidate_state=candidate_state,
+    )
+
+
 @dataclass
 class GitSandbox:
     """Factory for isolated repositories and local bare remotes."""
@@ -233,7 +366,6 @@ def git_sandbox(tmp_path: Path) -> Iterable[GitSandbox]:
 
     source_root = Path(__file__).resolve().parents[2] / "src"
     environment = {
-        **os.environ,
         "HOME": str(home),
         "XDG_CONFIG_HOME": str(xdg),
         "GIT_CONFIG_GLOBAL": os.devnull,
@@ -246,14 +378,20 @@ def git_sandbox(tmp_path: Path) -> Iterable[GitSandbox]:
         "GIT_MERGE_AUTOEDIT": "no",
         "LC_ALL": "C",
         "LANG": "C",
-        "PYTHONPATH": os.pathsep.join(
-            [str(source_root), os.environ.get("PYTHONPATH", "")]
-        ).rstrip(os.pathsep),
-        "PATH": os.pathsep.join([str(dispatch), os.environ.get("PATH", "")]).rstrip(
-            os.pathsep
-        ),
+        "PYTHONPATH": str(source_root),
+        "PATH": os.pathsep.join([str(dispatch), os.environ["PATH"]]),
     }
     for variable in (
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_OBJECT_DIRECTORY_RELATIVE",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_COMMON_DIR",
+        "GIT_NAMESPACE",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_PREFIX",
         "GIT_ALLOW_PROTOCOL",
         "GIT_CONFIG_COUNT",
         "GIT_CONFIG_PARAMETERS",

@@ -161,6 +161,65 @@ def test_dirty_submodule_worktree_is_retained(git_sandbox: GitSandbox) -> None:
     assert "dirty-submodule" in repository.branch_names()
 
 
+def test_ignored_candidate_and_initialized_submodule_bytes_are_retained(
+    git_sandbox: GitSandbox,
+) -> None:
+    repository, _remote = _remote_with_primary(git_sandbox)
+    source = git_sandbox.make_submodule("ignored-source")
+    source.write(".gitignore", "ignored-inside-submodule.txt\n")
+    source.commit("ignore nested fixture", relative_path=".gitignore")
+    repository.write(".gitignore", "ignored-candidate.txt\n")
+    repository.commit("add candidate ignore rule", relative_path=".gitignore")
+    git_sandbox.initialise_submodule(repository, source)
+    repository.run("push", "origin", "HEAD:main")
+    candidate = git_sandbox.linked_worktree(repository, "ignored", "ignored")
+    candidate.run("-c", "protocol.file.allow=always", "submodule", "update", "--init")
+    candidate.write("ignored-candidate.txt", "keep ignored candidate bytes\n")
+    submodule = GitRepository(candidate.path / "vendor/submodule", candidate.env)
+    submodule.write("ignored-inside-submodule.txt", "keep ignored submodule bytes\n")
+    candidate_git_link = (candidate.path / ".git").read_bytes()
+    submodule_git_link = (submodule.path / ".git").read_bytes()
+
+    result = repository.git_up()
+
+    assert result.returncode == 0
+    assert_path_is_present(candidate.path)
+    assert candidate.current_branch() == "ignored"
+    assert "ignored" in repository.branch_names()
+    assert candidate.path.joinpath("ignored-candidate.txt").read_text() == (
+        "keep ignored candidate bytes\n"
+    )
+    assert submodule.path.joinpath("ignored-inside-submodule.txt").read_text() == (
+        "keep ignored submodule bytes\n"
+    )
+    assert (candidate.path / ".git").read_bytes() == candidate_git_link
+    assert (submodule.path / ".git").read_bytes() == submodule_git_link
+
+
+def test_uninspectable_linked_worktree_is_retained_with_useful_reason(
+    git_sandbox: GitSandbox,
+) -> None:
+    repository, _remote = _remote_with_primary(git_sandbox)
+    candidate = git_sandbox.linked_worktree(
+        repository, "uninspectable", "uninspectable"
+    )
+    git_link = candidate.path / ".git"
+    original_link = git_link.read_bytes()
+    git_link.write_bytes(b"gitdir: /path/that/does/not/exist\n")
+
+    try:
+        result = repository.git_up()
+    finally:
+        git_link.write_bytes(original_link)
+
+    assert result.returncode == 0
+    assert_path_is_present(candidate.path)
+    assert candidate.current_branch() == "uninspectable"
+    assert "uninspectable" in repository.branch_names()
+    assert str(candidate.path) in result.output
+    assert "uninspectable" in result.output.lower()
+
+
 def test_mixed_worktree_set_removes_only_eligible_clean_branch(
     git_sandbox: GitSandbox,
 ) -> None:
