@@ -154,7 +154,7 @@ def test_later_real_ref_failure_keeps_failed_ref_after_earlier_cleanup(
     assert "second-ref-failure" in result.output
 
 
-def test_preflight_invalid_candidate_prevents_earlier_cleanup(
+def test_preflight_invalid_candidate_does_not_block_earlier_cleanup(
     git_sandbox: GitSandbox,
 ) -> None:
     repository, _remote = _remote_with_primary(git_sandbox)
@@ -174,11 +174,12 @@ def test_preflight_invalid_candidate_prevents_earlier_cleanup(
         git_link.write_bytes(original_link)
 
     assert result.returncode == 0
-    assert first.path.exists()
-    assert "preflight-first" in repository.branch_names()
+    assert not first.path.exists()
+    assert "preflight-first" not in repository.branch_names()
     assert invalid.path.exists()
     assert "preflight-invalid" in repository.branch_names()
-    assert "preflight-invalid" in result.output
+    assert str(invalid.path) in result.output
+    assert "uninspectable" in result.output.lower()
 
 
 def test_existing_cooperative_lock_blocks_mutation_but_not_dry_run(
