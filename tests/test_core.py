@@ -8,6 +8,7 @@ from git_up.core import (
     CommandResult,
     GitUp,
     GitUpError,
+    RepositoryLock,
     Worktree,
     classify_worktree,
     default_branch_from_ls_remote,
@@ -21,11 +22,18 @@ class FakeGit:
         *,
         dirty_primary: bool = False,
         fail_prefix: tuple[str, ...] | None = None,
+        ignored_candidate: bool = False,
+        change_on_final_recheck: bool = False,
     ) -> None:
         self.calls: list[tuple[tuple[str, ...], Path | None, bool, bool]] = []
         self.dirty_primary = dirty_primary
         self.fail_prefix = fail_prefix
+        self.ignored_candidate = ignored_candidate
+        self.change_on_final_recheck = change_on_final_recheck
         self.worktree_lists = 0
+        self.removed = False
+        self.common_dir = Path("/tmp") / f"git-up-test-{id(self)}"
+        self.common_dir.mkdir(exist_ok=True)
 
     def run(
         self,
@@ -43,13 +51,25 @@ class FakeGit:
             return result(b"", returncode=1)
         if command == ("rev-parse", "--show-toplevel"):
             return result(b"/repo\n")
+        if command == ("rev-parse", "--git-common-dir"):
+            return result((str(self.common_dir) + "\n").encode())
         if command == ("worktree", "list", "--porcelain", "-z"):
             self.worktree_lists += 1
+            if self.change_on_final_recheck and self.worktree_lists >= 3:
+                changed = (
+                    b"worktree /repo\0HEAD "
+                    + SHA_A.encode()
+                    + b"\0branch refs/heads/trunk\0"
+                    b"\nworktree /repo-wt\0HEAD "
+                    + SHA_B.encode()
+                    + b"\0branch refs/heads/merged\0"
+                )
+                return result(changed)
             return result(
-                primary_worktree
-                if self.worktree_lists == 1
-                else b"worktree /repo\0HEAD " + SHA_A.encode() + b"\0"
+                b"worktree /repo\0HEAD " + SHA_A.encode() + b"\0"
                 b"branch refs/heads/trunk\0"
+                if self.removed
+                else primary_worktree
             )
         if command == ("config", "--get", "remote.origin.url"):
             return result(b"../origin\n")
@@ -68,14 +88,23 @@ class FakeGit:
             return result(
                 b" M file\n" if self.dirty_primary and cwd == Path("/repo") else b""
             )
+        if command[-1:] == ("--ignored=matching",) and self.ignored_candidate:
+            return result(b"!! cache/\n")
         if command == ("rev-parse", "--verify", "refs/remotes/origin/trunk^{commit}"):
             return result((SHA_B + "\n").encode())
         if command == ("rev-parse", "--verify", "HEAD^{commit}"):
+            return result((SHA_A + "\n").encode())
+        if command in {
+            ("rev-parse", "--verify", "refs/heads/trunk^{commit}"),
+            ("rev-parse", "--verify", "refs/heads/merged^{commit}"),
+        }:
             return result((SHA_A + "\n").encode())
         if command == ("merge-base", "--is-ancestor", SHA_A, SHA_B):
             return result(b"")
         if command == ("submodule", "status", "--recursive"):
             return result(b"")
+        if command[:2] == ("worktree", "remove"):
+            self.removed = True
         return result(b"")
 
 
@@ -118,6 +147,19 @@ def test_parse_nul_delimited_worktrees_preserves_lock_and_prunable_reasons() -> 
     ]
 
 
+def test_parse_nul_delimited_worktree_preserves_literal_newlines() -> None:
+    output = (
+        b"worktree /repo/line\n\0HEAD abc123\0branch refs/heads/feature\0"
+        b"\nworktree /repo/other\0HEAD def456\0branch refs/heads/other\0"
+        b"locked reason ending in newline\n\0"
+    )
+
+    worktrees = parse_worktree_list(output)
+
+    assert worktrees[0].path == Path("/repo/line\n")
+    assert worktrees[1].lock_reason == "reason ending in newline\n"
+
+
 def test_default_branch_is_read_from_symref_not_main_or_master() -> None:
     output = b"ref: refs/heads/trunk\tHEAD\n012345\tHEAD\n"
 
@@ -146,7 +188,6 @@ def test_classification_retains_every_defensive_case(
         worktree,
         primary=Path("/primary"),
         caller=Path("/caller"),
-        target="a",
         dirty=True if reason == "dirty" else False,
         inspectable=True,
         merged=reason != "unmerged",
@@ -163,12 +204,27 @@ def test_classification_retains_uninspectable_worktree() -> None:
             worktree,
             primary=Path("/primary"),
             caller=Path("/other"),
-            target="a",
             dirty=False,
             inspectable=False,
             merged=True,
         )
         == "uninspectable"
+    )
+
+
+def test_classification_retains_ignored_content_as_dirty() -> None:
+    worktree = Worktree(Path("/candidate"), "a", "feature")
+
+    assert (
+        classify_worktree(
+            worktree,
+            primary=Path("/primary"),
+            caller=Path("/other"),
+            dirty=True,
+            inspectable=True,
+            merged=True,
+        )
+        == "dirty"
     )
 
 
@@ -188,6 +244,10 @@ def test_dry_run_uses_only_read_only_git_commands_and_reports_plan() -> None:
     assert "Would remove worktree /repo-wt" in output.getvalue()
     assert "no repository changes" in output.getvalue()
     assert all(read_only for _, _, _, read_only in fake.calls)
+    assert not fake.common_dir.joinpath(RepositoryLock.filename).exists()
+    assert ("ls-remote", "--symref", "origin", "HEAD") in {
+        call[0] for call in fake.calls
+    }
     assert not any(
         command[0:2]
         in {
@@ -211,10 +271,32 @@ def test_normal_run_fast_forwards_then_removes_only_merged_candidate() -> None:
     assert ("fetch", "--prune", "origin") in commands
     assert ("merge", "--ff-only", "refs/remotes/origin/trunk") in commands
     assert ("worktree", "remove", "--force", "--", "/repo-wt") in commands
-    assert ("branch", "-d", "--", "merged") in commands
+    assert ("update-ref", "-d", "refs/heads/merged", SHA_A) in commands
+    assert not any(command[:2] == ("branch", "-d") for command in commands)
+    assert not any(command[:2] == ("submodule", "deinit") for command in commands)
+    assert not any(command[:2] == ("submodule", "status") for command in commands)
     assert ("worktree", "prune") in commands
     assert "Updated primary worktree" in output.getvalue()
     assert "Removed worktree /repo-wt" in output.getvalue()
+
+
+def test_ignored_content_is_dirty_for_removal_preflight() -> None:
+    fake = FakeGit(ignored_candidate=True)
+    updater = GitUp(git=fake, cwd=Path("/repo"))
+
+    assert updater._is_dirty(Path("/repo-wt"), include_ignored=True)
+    assert not updater._is_dirty(Path("/repo-wt"), include_ignored=False)
+
+
+def test_final_recheck_retains_worktree_changed_after_preflight() -> None:
+    fake = FakeGit(change_on_final_recheck=True)
+    output = StringIO()
+
+    code = GitUp(git=fake, cwd=Path("/repo"), stdout=output).run()
+
+    assert code == 0
+    assert not any(command[:2] == ("worktree", "remove") for command, *_ in fake.calls)
+    assert "final recheck" in output.getvalue()
 
 
 def test_dirty_primary_refuses_before_fetch_or_cleanup() -> None:
@@ -248,3 +330,21 @@ def test_failed_worktree_removal_does_not_delete_its_branch() -> None:
     commands = [call[0] for call in fake.calls]
     assert ("worktree", "remove", "--force", "--", "/repo-wt") in commands
     assert not any(command[:2] == ("branch", "-d") for command in commands)
+
+
+def test_repository_lock_is_atomic_and_released(tmp_path: Path) -> None:
+    common_dir = tmp_path / "common"
+    common_dir.mkdir()
+    first = RepositoryLock(common_dir)
+    first.acquire()
+    try:
+        assert first.path.read_text(encoding="utf-8").startswith("pid=")
+        with pytest.raises(GitUpError, match="remove it after confirming"):
+            RepositoryLock(common_dir).acquire()
+    finally:
+        first.release()
+
+    second = RepositoryLock(common_dir)
+    second.acquire()
+    second.release()
+    assert not second.path.exists()
