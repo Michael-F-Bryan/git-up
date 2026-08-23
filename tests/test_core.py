@@ -366,6 +366,7 @@ def test_recursive_submodule_inspection_failure_retains_candidate() -> None:
 
 def test_final_candidate_preflight_precedes_first_worktree_removal() -> None:
     fake = FakeGit()
+    candidate_path = Path("/repo-wt")
 
     assert GitUp(git=fake, cwd=Path("/repo")).run() == 0
 
@@ -377,18 +378,40 @@ def test_final_candidate_preflight_precedes_first_worktree_removal() -> None:
         "--ignored=matching",
         "-z",
     )
-    final_status_index = max(
+    candidate_gitlinks = ("ls-files", "--stage", "-z")
+    expected_candidate_inspection = [
+        (("rev-parse", "--verify", "HEAD^{commit}"), candidate_path),
+        (("rev-parse", "--verify", "refs/heads/merged^{commit}"), candidate_path),
+        (("merge-base", "--is-ancestor", SHA_A, SHA_B), candidate_path),
+        (candidate_status, candidate_path),
+        (candidate_gitlinks, candidate_path),
+    ]
+    candidate_calls = [
+        (command, cwd) for command, cwd, *_rest in fake.calls if cwd == candidate_path
+    ]
+
+    assert candidate_calls == expected_candidate_inspection * 2
+    assert candidate_calls.count((candidate_status, candidate_path)) == 2
+    assert candidate_calls.count((candidate_gitlinks, candidate_path)) == 2
+
+    candidate_call_indices = [
         index
-        for index, (command, cwd, *_rest) in enumerate(fake.calls)
-        if command == candidate_status and cwd == Path("/repo-wt")
-    )
+        for index, (_command, cwd, *_rest) in enumerate(fake.calls)
+        if cwd == candidate_path
+    ]
+    assert len(candidate_call_indices) == len(expected_candidate_inspection) * 2
     first_remove_index = next(
         index
         for index, (command, *_rest) in enumerate(fake.calls)
         if command[:2] == ("worktree", "remove")
     )
 
-    assert final_status_index < first_remove_index
+    final_revalidation_start = candidate_call_indices[
+        len(expected_candidate_inspection)
+    ]
+    final_revalidation_end = candidate_call_indices[-1]
+    assert final_revalidation_start < first_remove_index
+    assert final_revalidation_end < first_remove_index
 
 
 def test_final_recheck_retains_worktree_changed_after_preflight() -> None:
