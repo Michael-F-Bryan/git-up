@@ -1,0 +1,12 @@
+{
+  "packages": {
+    ".": {
+      "release-type": "python",
+      "package-name": "mfb-git-up",
+      "changelog-path": "CHANGELOG.md"
+    }
+  },
+  "include-component-in-tag": false,
+  "include-v-in-tag": true,
+  "tag-separator": ""
+}

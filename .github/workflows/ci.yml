@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: Checks (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Set up uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          enable-cache: true
+      - name: Install Python
+        run: uv python install "${{ matrix.python-version }}"
+      - name: Sync locked environment
+        run: uv sync --locked --python "${{ matrix.python-version }}"
+      - name: Run Ruff lint
+        run: uv run --python "${{ matrix.python-version }}" ruff check .
+      - name: Check Ruff formatting
+        run: uv run --python "${{ matrix.python-version }}" ruff format --check .
+      - name: Run mypy
+        run: uv run --python "${{ matrix.python-version }}" mypy
+      - name: Run pytest
+        run: uv run --python "${{ matrix.python-version }}" pytest
+
+  package:
+    name: Build and install package
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Set up uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          enable-cache: true
+      - name: Install Python
+        run: uv python install 3.11
+      - name: Build distributions
+        run: uv build --no-sources
+      - name: Install as uv tool
+        run: |
+          uv tool install .
+          echo "$(uv tool dir --bin)" >> "$GITHUB_PATH"
+      - name: Exercise Git dispatch in a temporary repository
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PATH="$(uv tool dir --bin):$PATH"
+          command -v git-up
+          temporary_repository="$(mktemp -d)"
+          trap 'rm -rf "$temporary_repository"' EXIT
+          git -C "$temporary_repository" init
+          git -C "$temporary_repository" config user.name "CI"
+          git -C "$temporary_repository" config user.email "ci@example.invalid"
+          cd "$temporary_repository"
+          # Git reserves --help for manual lookup; -h dispatches extension help.
+          git up --help || test "$?" -eq 1
+          git up -h
+          git up --version
