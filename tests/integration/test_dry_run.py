@@ -83,8 +83,7 @@ def test_dry_run_preserves_mixed_dirty_ignored_and_initialized_submodule_state(
     assert "ignored-candidate.txt" in before.status
     assert "ignored-inside-submodule.txt" in before.status
     assert any(
-        relative == "ignored-candidate.txt"
-        and content == b"ignored dirt\n"
+        relative == "ignored-candidate.txt" and content == b"ignored dirt\n"
         for path, content in before.files
         for relative in [path.rsplit(":", maxsplit=1)[-1]]
     )
