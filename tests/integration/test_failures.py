@@ -50,14 +50,13 @@ def test_fetch_failure_prevents_worktree_and_branch_cleanup(
         ("untracked-primary-dirt", "untracked primary bytes\n"),
     ],
 )
-def test_dirty_primary_dispatch_fails_before_any_mutation(
+def test_dirty_primary_current_target_allows_housekeeping_without_changing_checkout(
     git_sandbox: GitSandbox,
     dirty_name: str,
     dirty_content: str,
 ) -> None:
     repository, _remote = _remote_with_primary(git_sandbox)
     repository.run("fetch", "origin")
-    repository.git_dir().joinpath("ORIG_HEAD").write_bytes(b"fixture ORIG_HEAD\n")
     candidate = git_sandbox.linked_worktree(
         repository, "primary-safety", "primary-safety"
     )
@@ -75,15 +74,14 @@ def test_dirty_primary_dispatch_fails_before_any_mutation(
     result = repository.git_up()
     after = snapshot_repository(repository, candidates=[candidate, stale])
 
-    assert result.returncode != 0
-    assert before.fetch_head is not None
-    assert before.orig_head == b"fixture ORIG_HEAD\n"
-    assert after == before
-    assert repository.head() == before.head
-    assert candidate.path.exists()
-    assert "primary-safety" in repository.branch_names()
-    assert str(stale_path) in repository.worktree_porcelain()
-    assert "dirty" in result.output.lower()
+    assert result.returncode == 0, result.output
+    assert after.head == before.head
+    assert after.status == before.status
+    assert after.indices[0] == before.indices[0]
+    assert candidate.path is not None and not candidate.path.exists()
+    assert "primary-safety" not in repository.branch_names()
+    assert str(stale_path) not in repository.worktree_porcelain()
+    assert "already up to date" in result.output
 
 
 def test_ignored_only_primary_state_does_not_block_safe_update(
@@ -152,6 +150,30 @@ def test_later_real_ref_failure_keeps_failed_ref_after_earlier_cleanup(
     assert "second-ref-failure" not in repository.worktree_porcelain()
     assert ref_lock.read_bytes() == b"held by another real Git operation\n"
     assert "second-ref-failure" in result.output
+
+
+def test_first_real_ref_failure_does_not_block_later_branch_cleanup(
+    git_sandbox: GitSandbox,
+) -> None:
+    repository, _remote = _remote_with_primary(git_sandbox)
+    first = git_sandbox.linked_worktree(
+        repository, "first-ref-failure", "first-ref-failure"
+    )
+    second = git_sandbox.linked_worktree(repository, "second-cleanup", "second-cleanup")
+    ref_lock = repository.git_dir() / "refs/heads/first-ref-failure.lock"
+    ref_lock.parent.mkdir(parents=True, exist_ok=True)
+    ref_lock.write_bytes(b"held by another real Git operation\n")
+
+    result = repository.git_up()
+
+    assert result.returncode != 0
+    assert not first.path.exists()
+    assert "first-ref-failure" in repository.branch_names()
+    assert not second.path.exists()
+    assert "second-cleanup" not in repository.branch_names()
+    assert ref_lock.read_bytes() == b"held by another real Git operation\n"
+    assert "first-ref-failure" in result.output
+    assert "Deleted merged branch second-cleanup." in result.output
 
 
 def test_preflight_invalid_candidate_does_not_block_earlier_cleanup(

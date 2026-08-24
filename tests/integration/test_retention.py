@@ -297,3 +297,110 @@ def test_locked_stale_worktree_metadata_is_retained(git_sandbox: GitSandbox) -> 
     assert str(stale_path) in repository.worktree_porcelain()
     assert "preserve stale metadata" in repository.worktree_porcelain()
     assert "locked-stale" in repository.branch_names()
+
+
+def test_stale_unlocked_default_metadata_is_pruned_and_branch_preserved(
+    git_sandbox: GitSandbox,
+) -> None:
+    repository, _remote = _remote_with_primary(git_sandbox)
+    repository.run("switch", "-c", "feature-caller")
+    stale_path = git_sandbox.root / "stale-default"
+    repository.run("worktree", "add", str(stale_path), "main")
+    shutil.rmtree(stale_path)
+    candidate = git_sandbox.linked_worktree(repository, "merged-candidate", "merged")
+
+    result = repository.git_up()
+
+    assert result.returncode == 0, result.output
+    assert str(stale_path) not in repository.worktree_porcelain()
+    assert "main" in repository.branch_names()
+    assert not candidate.path.exists()
+    assert "merged" not in repository.branch_names()
+
+
+def test_stale_locked_default_current_allows_housekeeping_and_retains_metadata(
+    git_sandbox: GitSandbox,
+) -> None:
+    repository, _remote = _remote_with_primary(git_sandbox)
+    repository.run("switch", "-c", "feature-caller")
+    stale_path = git_sandbox.root / "locked-default"
+    repository.run("worktree", "add", str(stale_path), "main")
+    stale = GitRepository(stale_path, repository.env)
+    lock = stale.run(
+        "worktree",
+        "lock",
+        "--reason",
+        "temporarily unavailable",
+        str(stale.path),
+        check=False,
+    )
+    if lock.returncode != 0 and (
+        "unknown" in lock.output.lower()
+        or "not a git worktree command" in lock.output.lower()
+    ):
+        pytest.skip("this Git does not support worktree locking")
+    assert lock.returncode == 0, lock.output
+    stale_path = stale.path
+    shutil.rmtree(stale_path)
+    candidate = git_sandbox.linked_worktree(repository, "merged-candidate", "merged")
+
+    result = repository.git_up()
+
+    assert result.returncode == 0, result.output
+    assert str(stale_path) in repository.worktree_porcelain()
+    assert "temporarily unavailable" in repository.worktree_porcelain()
+    assert "main" in repository.branch_names()
+    assert not candidate.path.exists()
+
+
+def test_stale_locked_default_ahead_refuses_without_advancing_or_cleaning(
+    git_sandbox: GitSandbox,
+) -> None:
+    repository, remote = _remote_with_primary(git_sandbox)
+    repository.run("switch", "-c", "feature-caller")
+    stale_path = git_sandbox.root / "locked-default"
+    repository.run("worktree", "add", str(stale_path), "main")
+    stale = GitRepository(stale_path, repository.env)
+    lock = stale.run(
+        "worktree",
+        "lock",
+        "--reason",
+        "temporarily unavailable",
+        str(stale.path),
+        check=False,
+    )
+    if lock.returncode != 0 and (
+        "unknown" in lock.output.lower()
+        or "not a git worktree command" in lock.output.lower()
+    ):
+        pytest.skip("this Git does not support worktree locking")
+    assert lock.returncode == 0, lock.output
+    stale_path = stale.path
+    old_main = repository.run("rev-parse", "refs/heads/main").stdout.strip()
+    shutil.rmtree(stale_path)
+    candidate = git_sandbox.linked_worktree(repository, "merged-candidate", "merged")
+    publisher = git_sandbox.clone(remote, "publisher")
+    publisher.write("README.md", "remote update\n")
+    publisher.commit("advance main")
+    publisher.run("push", "origin", "HEAD:main")
+
+    result = repository.git_up()
+
+    assert result.returncode != 0
+    assert repository.run("rev-parse", "refs/heads/main").stdout.strip() == old_main
+    assert str(stale_path) in repository.worktree_porcelain()
+    assert candidate.path.exists()
+    assert "merged" in repository.branch_names()
+
+
+def test_merged_local_branch_without_worktree_is_deleted(
+    git_sandbox: GitSandbox,
+) -> None:
+    repository, _remote = _remote_with_primary(git_sandbox)
+    repository.run("branch", "merged-without-worktree")
+    assert "merged-without-worktree" in repository.branch_names()
+
+    result = repository.git_up()
+
+    assert result.returncode == 0, result.output
+    assert "merged-without-worktree" not in repository.branch_names()

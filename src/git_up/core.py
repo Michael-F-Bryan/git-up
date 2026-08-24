@@ -289,12 +289,15 @@ def classify_worktree(
     dirty: bool,
     inspectable: bool,
     merged: bool,
+    default_branch: str | None = None,
 ) -> str | None:
     """Return a defensive retention reason, or ``None`` for a removal candidate."""
     if _same_path(worktree.path, caller):
         return "current caller"
     if _same_path(worktree.path, primary):
         return "primary"
+    if default_branch is not None and worktree.branch == default_branch:
+        return "default branch"
     if worktree.detached or worktree.branch is None:
         return "detached"
     if worktree.locked:
@@ -359,71 +362,128 @@ class GitUp:
             )
 
         default_branch = self._default_branch()
-        self._validate_primary_branch(primary, default_branch)
-        primary_dirty = self._is_dirty(primary.path, include_ignored=False)
-        if primary_dirty and not dry_run:
-            raise GitUpError(
-                f"primary worktree {primary.path} is dirty; refusing to sync"
+        default_record = next(
+            (item for item in worktrees if item.branch == default_branch), None
+        )
+        default_worktree = (
+            default_record
+            if default_record is not None
+            and not default_record.prunable
+            and (
+                _same_path(default_record.path, primary.path)
+                or default_record.path.exists()
             )
-        if primary_dirty:
-            print(
-                f"Retained primary update: {primary.path} (dirty; update refused).",
-                file=self.stdout,
-            )
-            return 1
+            else None
+        )
 
         if not dry_run:
             self._run_git(["fetch", "--prune", "origin"], cwd=self.cwd)
             print("Fetched and pruned origin.", file=self.stdout)
         target = self._remote_target(default_branch)
+
+        default_item = None
+        if default_worktree is not None:
+            default_item = self._inspect(
+                default_worktree,
+                target=target,
+                include_ignored=False,
+                reason="default branch",
+            )
+            if default_item.head_oid != target and default_item.dirty:
+                raise GitUpError(
+                    f"default worktree {default_worktree.path} is dirty; "
+                    "refusing to sync"
+                )
+        elif default_record is not None and default_record.locked:
+            local_default_oid = self._local_branch_oid(default_branch, caller)
+            if local_default_oid != target:
+                raise GitUpError(
+                    f"locked default worktree metadata for {default_branch} is "
+                    "unavailable; refusing to advance the local branch behind it"
+                )
+
         plan = self._build_plan(
             worktrees,
             primary=primary.path,
             caller=caller,
             target=target,
-        )
-        primary_item = next(
-            item for item in plan if _same_path(item.worktree.path, primary.path)
+            default_branch=default_branch,
         )
 
         if dry_run:
-            if primary_item.head_oid == target:
-                print(
-                    f"Primary worktree {primary.path} is already up to date "
-                    f"at {target}.",
-                    file=self.stdout,
-                )
+            if default_item is not None:
+                if default_item.head_oid == target:
+                    print(
+                        f"Default branch worktree {default_item.worktree.path} is "
+                        f"already up to date at {target}.",
+                        file=self.stdout,
+                    )
+                else:
+                    print(
+                        f"Would fast-forward default branch worktree "
+                        f"{default_item.worktree.path} to {target}.",
+                        file=self.stdout,
+                    )
             else:
                 print(
-                    f"Would fast-forward primary worktree {primary.path} to {target}.",
+                    f"Would fast-forward local branch {default_branch} to {target}.",
                     file=self.stdout,
                 )
-            self._cleanup(plan, caller=caller, target=target, dry_run=True)
+            self._cleanup(
+                plan,
+                caller=caller,
+                target=target,
+                default_branch=default_branch,
+                dry_run=True,
+            )
             print("Dry run: no repository changes were made.", file=self.stdout)
             return 0
 
-        self._revalidate(
-            primary_item,
-            caller=caller,
-            target=target,
-            include_ignored=False,
-        )
-        if primary_item.head_oid == target:
-            print(
-                f"Primary worktree {primary.path} is already up to date at {target}.",
-                file=self.stdout,
-            )
+        if default_item is not None:
+            if default_item.head_oid == target:
+                print(
+                    f"Default branch worktree {default_item.worktree.path} is "
+                    f"already up to date at {target}.",
+                    file=self.stdout,
+                )
+            else:
+                if not default_item.merged:
+                    raise GitUpError(
+                        f"local default branch {default_branch} diverges from "
+                        f"origin/{default_branch}; refusing to reset or merge"
+                    )
+                self._revalidate(
+                    default_item,
+                    caller=caller,
+                    target=target,
+                    include_ignored=False,
+                )
+                self._run_git(
+                    ["merge", "--ff-only", f"refs/remotes/origin/{default_branch}"],
+                    cwd=default_item.worktree.path,
+                )
+                if _same_path(default_item.worktree.path, primary.path):
+                    message = f"Updated primary worktree {primary.path} to {target}."
+                else:
+                    message = (
+                        f"Updated default branch worktree {default_item.worktree.path} "
+                        f"to {target}."
+                    )
+                print(message, file=self.stdout)
         else:
-            self._run_git(
-                ["merge", "--ff-only", f"refs/remotes/origin/{default_branch}"],
-                cwd=primary.path,
-            )
-            print(
-                f"Updated primary worktree {primary.path} to {target}.",
-                file=self.stdout,
+            self._update_unchecked_out_default(
+                default_branch,
+                target=target,
+                caller=caller,
             )
 
-        failures = self._cleanup(plan, caller=caller, target=target, dry_run=False)
+        failures = self._cleanup(
+            plan,
+            caller=caller,
+            target=target,
+            default_branch=default_branch,
+            dry_run=False,
+        )
         if not failures:
             print("Pruned stale unlocked worktree metadata.", file=self.stdout)
         return 1 if failures else 0
@@ -463,14 +523,6 @@ class GitUp:
         )
         return default_branch_from_ls_remote(result.stdout)
 
-    def _validate_primary_branch(self, primary: Worktree, default_branch: str) -> None:
-        if primary.branch != default_branch:
-            actual = primary.branch or "(detached)"
-            raise GitUpError(
-                f"primary worktree is on {actual!r}, not origin/{default_branch!s}; "
-                "refusing to update it"
-            )
-
     def _remote_target(self, default_branch: str) -> str:
         result = self._run_git(
             [
@@ -493,6 +545,56 @@ class GitUp:
                 f"origin/{default_branch} is unavailable after fetching origin"
             )
         return target
+
+    def _local_branch_oid(self, branch: str, cwd: Path) -> str | None:
+        result = self._run_git(
+            ["rev-parse", "--verify", f"refs/heads/{branch}^{{commit}}"],
+            cwd=cwd,
+            check=False,
+        )
+        if result.returncode == 0:
+            value = _text(result.stdout)
+            if not re.fullmatch(r"[0-9a-fA-F]{40,64}", value):
+                raise GitUpError(
+                    f"Git returned an invalid commit for refs/heads/{branch}."
+                )
+            return value
+        if result.returncode == 128:
+            return None
+        raise _command_error(
+            ["git", "rev-parse", "--verify", f"refs/heads/{branch}^{{commit}}"],
+            cwd,
+            result,
+        )
+
+    def _update_unchecked_out_default(
+        self, branch: str, *, target: str, caller: Path
+    ) -> None:
+        expected = self._local_branch_oid(branch, caller)
+        if expected == target:
+            print(
+                f"Local branch {branch} is already up to date at {target}.",
+                file=self.stdout,
+            )
+            return
+        if expected is not None and not self._is_ancestor(expected, target, caller):
+            raise GitUpError(
+                f"local default branch {branch} diverges from origin/{branch}; "
+                "refusing to reset or merge"
+            )
+        current = self._local_branch_oid(branch, caller)
+        if current != expected:
+            raise GitUpError(f"local branch {branch} changed during final recheck")
+        self._run_git(
+            [
+                "update-ref",
+                f"refs/heads/{branch}",
+                target,
+                expected or "",
+            ],
+            cwd=caller,
+        )
+        print(f"Updated local branch {branch} to {target}.", file=self.stdout)
 
     def _rev_parse(self, revision: str, cwd: Path) -> str:
         result = self._run_git(
@@ -591,6 +693,7 @@ class GitUp:
         primary: Path,
         caller: Path,
         target: str,
+        default_branch: str,
     ) -> list[WorktreeInspection]:
         plan: list[WorktreeInspection] = []
         for worktree in worktrees:
@@ -609,6 +712,7 @@ class GitUp:
                     dirty=False,
                     inspectable=True,
                     merged=True,
+                    default_branch=default_branch,
                 )
                 if reason is not None:
                     plan.append(self._retained(worktree, reason))
@@ -631,6 +735,7 @@ class GitUp:
                             dirty=inspected.dirty,
                             inspectable=True,
                             merged=inspected.merged,
+                            default_branch=default_branch,
                         ),
                     )
             plan.append(inspection)
@@ -678,9 +783,14 @@ class GitUp:
         *,
         caller: Path,
         target: str,
+        default_branch: str,
         dry_run: bool,
     ) -> bool:
         failures = False
+        preflight_branches = {
+            item.worktree.branch for item in plan if item.worktree.branch is not None
+        }
+        removed_branches: dict[str, str] = {}
         for item in plan:
             worktree = item.worktree
             reason = item.reason
@@ -716,26 +826,23 @@ class GitUp:
             expected_oid = item.ref_oid
             if branch is None or expected_oid is None:
                 continue
-            try:
-                remaining = self._worktrees(caller)
-                if any(candidate.branch == branch for candidate in remaining):
-                    print(
-                        f"Retained branch {branch}: another worktree uses it.",
-                        file=self.stdout,
-                    )
-                else:
-                    self._run_git(
-                        ["update-ref", "-d", f"refs/heads/{branch}", expected_oid],
-                        cwd=caller,
-                    )
-                    print(f"Deleted merged branch {branch}.", file=self.stdout)
-            except GitUpError as error:
-                failures = True
-                print(
-                    f"Failed to delete branch {branch} after removing "
-                    f"{worktree.path}: {error}.",
-                    file=self.stdout,
+            removed_branches[branch] = expected_oid
+
+        try:
+            failures = (
+                self._cleanup_branches(
+                    removed_branches,
+                    preflight_branches=preflight_branches,
+                    caller=caller,
+                    target=target,
+                    default_branch=default_branch,
+                    dry_run=dry_run,
                 )
+                or failures
+            )
+        except GitUpError as error:
+            failures = True
+            print(f"Failed to clean up merged branches: {error}.", file=self.stdout)
         if not dry_run:
             try:
                 self._run_git(["worktree", "prune"], cwd=caller)
@@ -745,4 +852,77 @@ class GitUp:
                     f"Failed to prune stale worktree metadata: {error}.",
                     file=self.stdout,
                 )
+        return failures
+
+    def _local_branches(self, cwd: Path) -> list[str]:
+        result = self._run_git(
+            ["for-each-ref", "--format=%(refname:short)", "refs/heads"], cwd=cwd
+        )
+        return [line for line in _text(result.stdout).splitlines() if line]
+
+    def _cleanup_branches(
+        self,
+        removed_branches: dict[str, str],
+        *,
+        preflight_branches: set[str],
+        caller: Path,
+        target: str,
+        default_branch: str,
+        dry_run: bool,
+    ) -> bool:
+        remaining = self._worktrees(caller)
+        remaining_branches = {
+            item.branch for item in remaining if item.branch is not None
+        }
+        candidates = dict(removed_branches)
+        for branch in self._local_branches(caller):
+            if branch in preflight_branches or branch in remaining_branches:
+                continue
+            if branch == default_branch:
+                continue
+            current_oid = self._local_branch_oid(branch, caller)
+            if current_oid is None:
+                continue
+            if not self._is_ancestor(current_oid, target, caller):
+                continue
+            confirmed_oid = self._local_branch_oid(branch, caller)
+            if confirmed_oid != current_oid:
+                print(
+                    f"Retained branch {branch}: changed during final recheck.",
+                    file=self.stdout,
+                )
+                continue
+            candidates[branch] = current_oid
+
+        failures = False
+        for branch, expected_oid in candidates.items():
+            if branch == default_branch:
+                print(
+                    f"Retained branch {branch}: another worktree uses it.",
+                    file=self.stdout,
+                )
+                continue
+            if dry_run:
+                print(f"Would delete merged branch {branch}.", file=self.stdout)
+                continue
+            try:
+                remaining = self._worktrees(caller)
+                if any(item.branch == branch for item in remaining):
+                    print(
+                        f"Retained branch {branch}: another worktree uses it.",
+                        file=self.stdout,
+                    )
+                    continue
+                self._run_git(
+                    ["update-ref", "-d", f"refs/heads/{branch}", expected_oid],
+                    cwd=caller,
+                )
+            except GitUpError as error:
+                failures = True
+                print(
+                    f"Failed to delete branch {branch}: {error}.",
+                    file=self.stdout,
+                )
+                continue
+            print(f"Deleted merged branch {branch}.", file=self.stdout)
         return failures

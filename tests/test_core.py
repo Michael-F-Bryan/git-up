@@ -28,6 +28,7 @@ class FakeGit:
         dirty_submodule: bool = False,
         candidate_path: Path = Path("/repo-wt"),
         change_on_final_recheck: bool = False,
+        claim_branch_on_deletion: bool = False,
     ) -> None:
         self.calls: list[tuple[tuple[str, ...], Path | None, bool, bool]] = []
         self.dirty_primary = dirty_primary
@@ -38,6 +39,7 @@ class FakeGit:
         self.candidate_path = candidate_path
         self.submodule_path = candidate_path / "vendor/submodule"
         self.change_on_final_recheck = change_on_final_recheck
+        self.claim_branch_on_deletion = claim_branch_on_deletion
         self.worktree_lists = 0
         self.removed = False
         self.common_dir = Path("/tmp") / f"git-up-test-{id(self)}"
@@ -63,6 +65,19 @@ class FakeGit:
             return result((str(self.common_dir) + "\n").encode())
         if command == ("worktree", "list", "--porcelain", "-z"):
             self.worktree_lists += 1
+            if self.claim_branch_on_deletion and self.worktree_lists >= 4:
+                claimed = (
+                    b"worktree /repo\0HEAD "
+                    + SHA_A.encode()
+                    + b"\0branch refs/heads/trunk\0"
+                    b"\nworktree /repo-wt\0HEAD "
+                    + SHA_B.encode()
+                    + b"\0branch refs/heads/merged\0"
+                    b"\nworktree /claimed\0HEAD "
+                    + SHA_A.encode()
+                    + b"\0branch refs/heads/merged\0"
+                )
+                return result(claimed)
             if self.change_on_final_recheck and self.worktree_lists >= 3:
                 changed = (
                     b"worktree /repo\0HEAD "
@@ -316,6 +331,20 @@ def test_normal_run_fast_forwards_then_removes_only_merged_candidate() -> None:
     assert "Removed worktree /repo-wt" in output.getvalue()
 
 
+def test_branch_ownership_is_rechecked_before_direct_ref_deletion() -> None:
+    fake = FakeGit(claim_branch_on_deletion=True)
+    output = StringIO()
+
+    code = GitUp(git=fake, cwd=Path("/repo"), stdout=output).run()
+
+    assert code == 0
+    assert not any(
+        command == ("update-ref", "-d", "refs/heads/merged", SHA_A)
+        for command, *_ in fake.calls
+    )
+    assert "another worktree uses it" in output.getvalue()
+
+
 def test_ignored_content_is_dirty_for_removal_preflight() -> None:
     fake = FakeGit(ignored_candidate=True)
     updater = GitUp(git=fake, cwd=Path("/repo"))
@@ -425,14 +454,15 @@ def test_final_recheck_retains_worktree_changed_after_preflight() -> None:
     assert "final recheck" in output.getvalue()
 
 
-def test_dirty_primary_refuses_before_fetch_or_cleanup() -> None:
+def test_dirty_primary_refuses_after_fetch_before_cleanup() -> None:
     fake = FakeGit(dirty_primary=True)
 
     code = GitUp(git=fake, cwd=Path("/repo")).run()
 
     assert code == 1
     commands = [call[0] for call in fake.calls]
-    assert ("fetch", "--prune", "origin") not in commands
+    assert ("fetch", "--prune", "origin") in commands
+    assert not any(command[:2] == ("worktree", "remove") for command in commands)
     assert not any(command[:2] == ("worktree", "prune") for command in commands)
 
 

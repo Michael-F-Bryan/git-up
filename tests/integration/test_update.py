@@ -169,3 +169,279 @@ def test_posix_worktree_path_ending_in_newline_is_preserved(
     assert not candidate.path.exists()
     assert "newline-path" not in repository.branch_names()
     assert str(candidate.path) in result.output
+
+
+def test_dirty_feature_primary_updates_unchecked_out_default_and_preserves_caller(
+    git_sandbox: GitSandbox,
+) -> None:
+    repository, remote = _remote_with_primary(git_sandbox)
+    candidate = git_sandbox.linked_worktree(repository, "merged-candidate", "merged")
+    repository.run("switch", "-c", "feature-caller")
+    repository.write("README.md", "caller tracked dirt\n")
+    repository.write("caller-untracked.txt", "caller untracked dirt\n")
+    before_head = repository.head()
+    before_branch = repository.current_branch()
+    before_index = repository.run(
+        "rev-parse", "--path-format=absolute", "--git-path", "index"
+    ).stdout.strip()
+    before_index_bytes = Path(before_index).read_bytes()
+    before_files = (
+        repository.path.joinpath("README.md").read_bytes(),
+        repository.path.joinpath("caller-untracked.txt").read_bytes(),
+    )
+    before_status = repository.run(
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+        "--ignore-submodules=none",
+    ).stdout
+    publisher = git_sandbox.clone(remote, "publisher")
+    publisher.write("README.md", "remote update\n")
+    published_head = publisher.commit("advance main")
+    publisher.run("push", "origin", "HEAD:main")
+
+    result = repository.git_up()
+
+    assert result.returncode == 0, result.output
+    assert repository.current_branch() == before_branch == "feature-caller"
+    assert repository.head() == before_head
+    assert Path(before_index).read_bytes() == before_index_bytes
+    assert (
+        repository.path.joinpath("README.md").read_bytes(),
+        repository.path.joinpath("caller-untracked.txt").read_bytes(),
+    ) == before_files
+    assert (
+        repository.run(
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            "--ignore-submodules=none",
+        ).stdout
+        == before_status
+    )
+    assert (
+        repository.run("rev-parse", "refs/heads/main").stdout.strip() == published_head
+    )
+    assert not candidate.path.exists()
+    assert "merged" not in repository.branch_names()
+
+
+def test_clean_checked_out_default_worktree_updates_without_switching_caller(
+    git_sandbox: GitSandbox,
+) -> None:
+    repository, remote = _remote_with_primary(git_sandbox)
+    repository.run("switch", "-c", "feature-caller")
+    default_path = git_sandbox.root / "default-worktree"
+    repository.run("worktree", "add", str(default_path), "main")
+    default = GitRepository(default_path, repository.env)
+    publisher = git_sandbox.clone(remote, "publisher")
+    publisher.write("README.md", "remote default update\n")
+    published_head = publisher.commit("advance main")
+    publisher.run("push", "origin", "HEAD:main")
+    caller_head = repository.head()
+
+    result = repository.git_up()
+
+    assert result.returncode == 0, result.output
+    assert repository.current_branch() == "feature-caller"
+    assert repository.head() == caller_head
+    assert default.current_branch() == "main"
+    assert default.head() == published_head
+    assert default.path.joinpath("README.md").read_text() == "remote default update\n"
+
+
+def test_dirty_checked_out_default_worktree_fails_without_desynchronising_it(
+    git_sandbox: GitSandbox,
+) -> None:
+    repository, remote = _remote_with_primary(git_sandbox)
+    repository.run("switch", "-c", "feature-caller")
+    default_path = git_sandbox.root / "dirty-default-worktree"
+    repository.run("worktree", "add", str(default_path), "main")
+    default = GitRepository(default_path, repository.env)
+    default.write("README.md", "dirty default\n")
+    before_head = default.head()
+    before_index_path = default.run(
+        "rev-parse", "--path-format=absolute", "--git-path", "index"
+    ).stdout.strip()
+    before_index = Path(before_index_path).read_bytes()
+    before_status = default.run(
+        "status", "--porcelain=v1", "--untracked-files=all", "--ignore-submodules=none"
+    ).stdout
+    publisher = git_sandbox.clone(remote, "publisher")
+    publisher.write("README.md", "remote default update\n")
+    publisher.commit("advance main")
+    publisher.run("push", "origin", "HEAD:main")
+
+    result = repository.git_up()
+
+    assert result.returncode != 0
+    assert repository.current_branch() == "feature-caller"
+    assert default.current_branch() == "main"
+    assert default.head() == before_head
+    assert Path(before_index_path).read_bytes() == before_index
+    assert (
+        default.run(
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            "--ignore-submodules=none",
+        ).stdout
+        == before_status
+    )
+    assert repository.run("rev-parse", "refs/heads/main").stdout.strip() == before_head
+
+
+def test_dirty_checked_out_default_already_current_allows_housekeeping(
+    git_sandbox: GitSandbox,
+) -> None:
+    repository, _remote = _remote_with_primary(git_sandbox)
+    caller = git_sandbox.linked_worktree(repository, "caller", "caller")
+    candidate = git_sandbox.linked_worktree(repository, "merged-candidate", "merged")
+    repository.write("README.md", "dirty default\n")
+    repository.write("default-untracked.txt", "preserve me\n")
+    before_head = repository.head()
+    before_branch = repository.current_branch()
+    before_index_path = repository.run(
+        "rev-parse", "--path-format=absolute", "--git-path", "index"
+    ).stdout.strip()
+    before_index = Path(before_index_path).read_bytes()
+    before_files = (
+        repository.path.joinpath("README.md").read_bytes(),
+        repository.path.joinpath("default-untracked.txt").read_bytes(),
+    )
+    before_status = repository.run(
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+        "--ignore-submodules=none",
+    ).stdout
+
+    result = caller.git_up()
+
+    assert result.returncode == 0, result.output
+    assert repository.current_branch() == before_branch == "main"
+    assert repository.head() == before_head
+    assert Path(before_index_path).read_bytes() == before_index
+    assert (
+        repository.path.joinpath("README.md").read_bytes(),
+        repository.path.joinpath("default-untracked.txt").read_bytes(),
+    ) == before_files
+    assert (
+        repository.run(
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            "--ignore-submodules=none",
+        ).stdout
+        == before_status
+    )
+    assert not candidate.path.exists()
+    assert caller.path.exists()
+
+
+def test_dry_run_refuses_dirty_default_when_known_target_is_ahead(
+    git_sandbox: GitSandbox,
+) -> None:
+    repository, remote = _remote_with_primary(git_sandbox)
+    repository.write("README.md", "dirty default\n")
+    publisher = git_sandbox.clone(remote, "publisher")
+    publisher.write("README.md", "remote update\n")
+    publisher.commit("advance main")
+    publisher.run("push", "origin", "HEAD:main")
+    repository.run("fetch", "origin", "main")
+    before_status = repository.run(
+        "status", "--porcelain=v1", "--untracked-files=all", "--ignore-submodules=none"
+    ).stdout
+
+    result = repository.git_up("--dry-run")
+
+    assert result.returncode != 0
+    assert "dirty" in result.output.lower()
+    assert "would fast-forward" not in result.output.lower()
+    assert (
+        repository.run(
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            "--ignore-submodules=none",
+        ).stdout
+        == before_status
+    )
+
+
+def test_dry_run_dirty_current_default_shows_housekeeping_plan(
+    git_sandbox: GitSandbox,
+) -> None:
+    repository, _remote = _remote_with_primary(git_sandbox)
+    candidate = git_sandbox.linked_worktree(repository, "merged-candidate", "merged")
+    repository.write("README.md", "dirty default\n")
+
+    result = repository.git_up("--dry-run")
+
+    assert result.returncode == 0, result.output
+    assert "already up to date" in result.output
+    assert f"Would remove worktree {candidate.path}" in result.output
+    assert "no repository changes" in result.output
+
+
+def test_dirty_feature_caller_creates_missing_local_default_ref(
+    git_sandbox: GitSandbox,
+) -> None:
+    repository, _remote = _remote_with_primary(git_sandbox)
+    target = repository.run("rev-parse", "origin/main").stdout.strip()
+    repository.run("switch", "-c", "feature-caller")
+    repository.write("README.md", "dirty caller\n")
+    repository.write("caller-untracked.txt", "keep caller dirt\n")
+    before_head = repository.head()
+    before_status = repository.run(
+        "status", "--porcelain=v1", "--untracked-files=all", "--ignore-submodules=none"
+    ).stdout
+    repository.run("update-ref", "-d", "refs/heads/main")
+
+    result = repository.git_up()
+
+    assert result.returncode == 0, result.output
+    assert repository.current_branch() == "feature-caller"
+    assert repository.head() == before_head
+    assert repository.run("rev-parse", "refs/heads/main").stdout.strip() == target
+    assert (
+        repository.run(
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            "--ignore-submodules=none",
+        ).stdout
+        == before_status
+    )
+
+
+def test_divergent_unchecked_out_default_is_refused_without_reset_or_merge(
+    git_sandbox: GitSandbox,
+) -> None:
+    repository, remote = _remote_with_primary(git_sandbox)
+    repository.write("local-only.txt", "local\n")
+    local_default_head = repository.commit(
+        "diverge local main", relative_path="local-only.txt"
+    )
+    publisher = git_sandbox.clone(remote, "publisher")
+    publisher.write("remote-only.txt", "remote\n")
+    remote_head = publisher.commit(
+        "diverge remote main", relative_path="remote-only.txt"
+    )
+    publisher.run("push", "origin", "HEAD:main")
+    repository.run("switch", "-c", "feature-caller")
+
+    result = repository.git_up()
+
+    assert result.returncode != 0
+    assert repository.current_branch() == "feature-caller"
+    assert (
+        repository.run("rev-parse", "refs/heads/main").stdout.strip()
+        == local_default_head
+    )
+    assert repository.run("rev-parse", "origin/main").stdout.strip() == remote_head
+    assert (
+        repository.run("rev-list", "--merges", "-1", "refs/heads/main").stdout.strip()
+        == ""
+    )
+    assert not repository.path.joinpath("remote-only.txt").exists()

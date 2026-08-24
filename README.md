@@ -26,7 +26,7 @@ A typical first run looks like this:
 
 ```console
 $ git up --dry-run
-Would fast-forward primary worktree /src/project to <origin HEAD>.
+Would fast-forward local branch main to <origin HEAD>.
 Would remove worktree /src/project/.worktrees/fix-logging.
 Retained worktree /src/project/.worktrees/review: dirty.
 Dry run: no repository changes were made.
@@ -39,25 +39,33 @@ The paths and commit IDs will, of course, be yours.
 From a listed worktree, `git up`:
 
 1. discovers the default branch advertised by `origin`;
-2. checks that the primary checkout is on that branch and has no tracked,
-   untracked, or submodule modifications;
-3. fetches and prunes `origin`, then fast-forwards the primary checkout to the
-   fetched remote-tracking branch with `--ff-only`;
-4. builds a complete cleanup plan for the other worktrees;
-5. rechecks each candidate immediately before acting on it;
-6. removes eligible worktrees, then deletes their merged branches; and
-7. prunes stale, unlocked worktree metadata.
+2. records the current caller and primary worktree as always-retained safety
+   boundaries;
+3. fetches and prunes `origin` on an ordinary run, resolves its target (or uses
+   the locally known target for a dry run), then checks a checked-out default
+   branch for tracked and untracked modifications;
+4. fast-forwards the clean default-branch worktree with `--ff-only`, or advances
+   an unchecked-out local default ref with an expected-old-OID compare-and-swap;
+5. builds a complete cleanup plan for the other worktrees;
+6. rechecks each candidate immediately before acting on it;
+7. removes eligible worktrees, deletes their merged branches, and deletes other
+   merged local branches that have no listed worktree; and
+8. prunes stale, unlocked worktree metadata.
 
-The current caller and the primary checkout are retained. A worktree is only a
-removal candidate when it is inspectable, unlocked, merged into the fetched
-remote target, and conservatively clean. That cleanliness includes tracked and
-untracked files, ignored files, and recursively initialised submodules. Detached,
-locked, prunable, dirty, unmerged, or uninspectable worktrees are left alone.
+The current caller and the primary checkout are retained regardless of branch or
+dirt. A checked-out default branch is also retained so it can be updated in
+place. Other worktrees are removal candidates only when they are inspectable and
+unlocked, merged into the fetched remote target, and conservatively clean. That
+cleanliness includes tracked and untracked files, ignored files, and recursively
+initialised submodules. Detached, locked, prunable, dirty, unmerged, or
+uninspectable worktrees are left alone.
 
-Branches are removed only after their worktree has been removed, and only when
-no other listed worktree uses the branch. Execution is best effort after complete
-preflight: if an operation fails, `git up` continues where it safely can and
-reports the failure. It does not roll back removals that already succeeded.
+Branches are removed only after their worktree has been removed, or when they are
+standalone local branches with no listed worktree. The default branch and every
+branch still used by a listed worktree are excluded. Execution is best effort
+after complete preflight: if an operation fails, `git up` continues where it
+safely can and reports the failure. It does not roll back removals that already
+succeeded.
 
 ## The safety trade-off
 
@@ -91,10 +99,14 @@ git up -h
 git up --version
 ```
 
-A dirty primary checkout refuses the sync on an ordinary run. A divergent
-primary checkout is not merged or reset: the fast-forward-only update fails
-instead. The remote named `origin` must advertise its default branch through its
-`HEAD` symref.
+A dirty checked-out default branch refuses an update when the target is ahead,
+but an already-current dirty default checkout still permits housekeeping without
+changing its branch, HEAD, index, or files. A dirty caller on another branch is
+preserved. Missing or prunable unlocked default metadata is cleaned up safely;
+missing locked metadata is retained, permits housekeeping when current, and
+refuses an advancing update. A divergent local default branch is not reset or
+merged: the update fails instead. The remote named `origin` must advertise its
+default branch through its `HEAD` symref.
 
 ## Development
 
