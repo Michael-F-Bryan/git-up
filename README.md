@@ -55,10 +55,16 @@ From a listed worktree, `git up`:
 The current caller and the primary checkout are retained regardless of branch or
 dirt. A checked-out default branch is also retained so it can be updated in
 place. Other worktrees are removal candidates only when they are inspectable and
-unlocked, merged into the fetched remote target, and conservatively clean. That
-cleanliness includes tracked and untracked files, ignored files, and recursively
-initialised submodules. Detached, locked, prunable, dirty, unmerged, or
-uninspectable worktrees are left alone.
+unlocked, with HEAD reachable from the fetched remote target, and clean of tracked
+changes and ordinary untracked files. These checks recurse through initialised
+submodules, including nested ones. Detached HEADs follow the same rules: a commit
+already retained in the target history does not need a branch to be disposable.
+Locked, prunable, dirty, unmerged, or uninspectable worktrees are left alone.
+
+Ignored content, such as `node_modules`, build output and caches, does not make a
+candidate dirty and is deleted with an otherwise eligible worktree, including
+inside initialised submodules. Use `git worktree lock <path>` to preserve an
+otherwise eligible checkout; ignored files alone are not a preservation mechanism.
 
 Branches are removed only after their worktree has been removed, or when they are
 standalone local branches with no listed worktree. The default branch and every

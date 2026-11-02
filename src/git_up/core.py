@@ -298,8 +298,6 @@ def classify_worktree(
         return "primary"
     if default_branch is not None and worktree.branch == default_branch:
         return "default branch"
-    if worktree.detached or worktree.branch is None:
-        return "detached"
     if worktree.locked:
         return "locked"
     if worktree.prunable:
@@ -386,7 +384,7 @@ class GitUp:
             default_item = self._inspect(
                 default_worktree,
                 target=target,
-                include_ignored=False,
+                recursive=False,
                 reason="default branch",
             )
             if default_item.head_oid != target and default_item.dirty:
@@ -456,7 +454,7 @@ class GitUp:
                     default_item,
                     caller=caller,
                     target=target,
-                    include_ignored=False,
+                    recursive=False,
                 )
                 self._run_git(
                     ["merge", "--ff-only", f"refs/remotes/origin/{default_branch}"],
@@ -605,8 +603,8 @@ class GitUp:
             raise GitUpError(f"Git returned no commit for {revision!r} in {cwd}")
         return value
 
-    def _is_dirty(self, cwd: Path, *, include_ignored: bool) -> bool:
-        if include_ignored:
+    def _is_dirty(self, cwd: Path, *, recursive: bool) -> bool:
+        if recursive:
             return self._is_dirty_recursively(cwd)
         result = self._run_git(
             [
@@ -625,7 +623,6 @@ class GitUp:
             "--porcelain=v1",
             "--untracked-files=all",
             "--ignore-submodules=none",
-            "--ignored=matching",
             "-z",
         ]
         result = self._run_git(args, cwd=cwd)
@@ -670,20 +667,19 @@ class GitUp:
         worktree: Worktree,
         *,
         target: str,
-        include_ignored: bool,
+        recursive: bool,
         reason: str | None = None,
     ) -> WorktreeInspection:
         head_oid = self._rev_parse("HEAD", worktree.path)
         if head_oid != worktree.head:
             raise GitUpError(f"worktree {worktree.path} changed during preflight")
         ref_oid: str | None = None
-        merged = False
         if worktree.branch is not None:
             ref_oid = self._rev_parse(f"refs/heads/{worktree.branch}", worktree.path)
             if ref_oid != head_oid:
                 raise GitUpError(f"branch {worktree.branch} changed during preflight")
-            merged = self._is_ancestor(head_oid, target, worktree.path)
-        dirty = self._is_dirty(worktree.path, include_ignored=include_ignored)
+        merged = self._is_ancestor(head_oid, target, worktree.path)
+        dirty = self._is_dirty(worktree.path, recursive=recursive)
         return WorktreeInspection(worktree, head_oid, ref_oid, dirty, merged, reason)
 
     def _build_plan(
@@ -701,7 +697,7 @@ class GitUp:
                 inspection = self._inspect(
                     worktree,
                     target=target,
-                    include_ignored=False,
+                    recursive=False,
                     reason="primary",
                 )
             else:
@@ -721,7 +717,7 @@ class GitUp:
                     inspected = self._inspect(
                         worktree,
                         target=target,
-                        include_ignored=True,
+                        recursive=True,
                     )
                 except GitUpError:
                     inspection = self._retained(worktree, "uninspectable")
@@ -751,7 +747,7 @@ class GitUp:
         *,
         caller: Path,
         target: str,
-        include_ignored: bool,
+        recursive: bool,
     ) -> WorktreeInspection:
         listed = next(
             (
@@ -768,7 +764,7 @@ class GitUp:
         current = self._inspect(
             listed,
             target=target,
-            include_ignored=include_ignored,
+            recursive=recursive,
             reason=item.reason,
         )
         if current != item:
@@ -805,7 +801,7 @@ class GitUp:
                     item,
                     caller=caller,
                     target=target,
-                    include_ignored=True,
+                    recursive=True,
                 )
             except GitUpError as error:
                 print(f"Retained worktree {worktree.path}: {error}.", file=self.stdout)

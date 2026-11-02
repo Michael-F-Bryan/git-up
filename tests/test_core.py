@@ -23,7 +23,6 @@ class FakeGit:
         *,
         dirty_primary: bool = False,
         fail_prefix: tuple[str, ...] | None = None,
-        ignored_candidate: bool = False,
         initialized_submodule: bool = False,
         dirty_submodule: bool = False,
         candidate_path: Path = Path("/repo-wt"),
@@ -33,7 +32,6 @@ class FakeGit:
         self.calls: list[tuple[tuple[str, ...], Path | None, bool, bool]] = []
         self.dirty_primary = dirty_primary
         self.fail_prefix = fail_prefix
-        self.ignored_candidate = ignored_candidate
         self.initialized_submodule = initialized_submodule
         self.dirty_submodule = dirty_submodule
         self.candidate_path = candidate_path
@@ -116,13 +114,10 @@ class FakeGit:
             "--porcelain=v1",
             "--untracked-files=all",
             "--ignore-submodules=none",
-            "--ignored=matching",
             "-z",
         ):
             if self.dirty_submodule and cwd == self.submodule_path:
-                return result(b"!! ignored-inside-submodule.txt\0")
-            if self.ignored_candidate and cwd == self.candidate_path:
-                return result(b"!! cache/\0")
+                return result(b" M README.md\0")
             return result(b"")
         if command == ("ls-files", "--stage", "-z"):
             if self.initialized_submodule and cwd == self.candidate_path:
@@ -222,7 +217,7 @@ def test_default_branch_is_read_from_symref_not_main_or_master() -> None:
     [
         (Worktree(Path("/caller"), "a", "feature"), "current caller"),
         (Worktree(Path("/primary"), "a", "main"), "primary"),
-        (Worktree(Path("/detached"), "a", None, detached=True), "detached"),
+        (Worktree(Path("/detached"), "a", None, detached=True), None),
         (Worktree(Path("/locked"), "a", "feature", locked=True), "locked"),
         (Worktree(Path("/dirty"), "a", "feature"), "dirty"),
         (Worktree(Path("/unmerged"), "b", "feature"), "unmerged"),
@@ -232,8 +227,8 @@ def test_default_branch_is_read_from_symref_not_main_or_master() -> None:
         ),
     ],
 )
-def test_classification_retains_every_defensive_case(
-    worktree: Worktree, reason: str
+def test_classification_applies_retention_rules(
+    worktree: Worktree, reason: str | None
 ) -> None:
     retained = classify_worktree(
         worktree,
@@ -263,7 +258,7 @@ def test_classification_retains_uninspectable_worktree() -> None:
     )
 
 
-def test_classification_retains_ignored_content_as_dirty() -> None:
+def test_classification_retains_dirty_content() -> None:
     worktree = Worktree(Path("/candidate"), "a", "feature")
 
     assert (
@@ -345,14 +340,6 @@ def test_branch_ownership_is_rechecked_before_direct_ref_deletion() -> None:
     assert "another worktree uses it" in output.getvalue()
 
 
-def test_ignored_content_is_dirty_for_removal_preflight() -> None:
-    fake = FakeGit(ignored_candidate=True)
-    updater = GitUp(git=fake, cwd=Path("/repo"))
-
-    assert updater._is_dirty(Path("/repo-wt"), include_ignored=True)
-    assert not updater._is_dirty(Path("/repo-wt"), include_ignored=False)
-
-
 def test_recursive_dirty_inspection_checks_initialized_submodule_status(
     tmp_path: Path,
 ) -> None:
@@ -366,14 +353,13 @@ def test_recursive_dirty_inspection_checks_initialized_submodule_status(
     fake.submodule_path.joinpath(".git").write_text("gitdir: /fake\n")
     updater = GitUp(git=fake, cwd=Path("/repo"))
 
-    assert updater._is_dirty(candidate_path, include_ignored=True)
+    assert updater._is_dirty(candidate_path, recursive=True)
     assert (
         (
             "status",
             "--porcelain=v1",
             "--untracked-files=all",
             "--ignore-submodules=none",
-            "--ignored=matching",
             "-z",
         ),
         fake.submodule_path,
@@ -404,7 +390,6 @@ def test_final_candidate_preflight_precedes_first_worktree_removal() -> None:
         "--porcelain=v1",
         "--untracked-files=all",
         "--ignore-submodules=none",
-        "--ignored=matching",
         "-z",
     )
     candidate_gitlinks = ("ls-files", "--stage", "-z")

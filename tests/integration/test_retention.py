@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import shutil
+from collections.abc import Sequence
+from io import StringIO
+from pathlib import Path
 
 import pytest
 from conftest import (
@@ -10,7 +13,10 @@ from conftest import (
     GitSandbox,
     assert_path_is_absent,
     assert_path_is_present,
+    snapshot_repository,
 )
+
+from git_up.core import CommandResult, GitUp, SubprocessGit
 
 
 def _remote_with_primary(
@@ -92,17 +98,15 @@ def test_unmerged_clean_worktree_is_retained(git_sandbox: GitSandbox) -> None:
     assert "unmerged" in repository.branch_names()
 
 
-def test_detached_worktree_is_retained(git_sandbox: GitSandbox) -> None:
+def test_merged_detached_worktree_is_removed(git_sandbox: GitSandbox) -> None:
     repository, _remote = _remote_with_primary(git_sandbox)
     candidate = git_sandbox.detached_worktree(repository, "detached")
-    detached_head = candidate.head()
 
     result = repository.git_up()
 
-    assert result.returncode == 0
-    assert_path_is_present(candidate.path)
-    assert candidate.current_branch() is None
-    assert candidate.head() == detached_head
+    assert result.returncode == 0, result.output
+    assert_path_is_absent(candidate.path)
+    assert str(candidate.path) not in repository.worktree_porcelain()
 
 
 def test_clean_initialised_submodule_worktree_is_removed(
@@ -161,32 +165,186 @@ def test_dirty_submodule_worktree_is_retained(git_sandbox: GitSandbox) -> None:
     assert "dirty-submodule" in repository.branch_names()
 
 
-def test_ignored_initialized_submodule_only_is_retained_with_dirty_reason(
-    git_sandbox: GitSandbox,
+@pytest.mark.parametrize("detached", [False, True])
+@pytest.mark.parametrize("submodule_depth", [0, 1, 2])
+def test_merged_worktree_with_ignored_content_is_removed(
+    git_sandbox: GitSandbox, detached: bool, submodule_depth: int
 ) -> None:
-    repository, _remote = _remote_with_primary(git_sandbox)
-    source = git_sandbox.make_submodule("ignored-source")
-    source.write(".gitignore", "ignored-inside-submodule.txt\n")
-    source.commit("ignore nested fixture", relative_path=".gitignore")
-    git_sandbox.initialise_submodule(repository, source)
-    repository.run("push", "origin", "HEAD:main")
-    candidate = git_sandbox.linked_worktree(repository, "ignored", "ignored")
-    candidate.run("-c", "protocol.file.allow=always", "submodule", "update", "--init")
-    submodule = GitRepository(candidate.path / "vendor/submodule", candidate.env)
-    submodule.write("ignored-inside-submodule.txt", "keep ignored submodule bytes\n")
-    submodule_git_link = (submodule.path / ".git").read_bytes()
+    repository, candidate, leaf = _candidate_with_ignored_content(
+        git_sandbox, detached=detached, submodule_depth=submodule_depth
+    )
+    # Exercise ignored content only at the deepest level, not hidden by root dirt.
+    parent = candidate.path
+    for _ in range(submodule_depth):
+        shutil.rmtree(parent / "cache")
+        parent /= "vendor/submodule"
+    before = snapshot_repository(
+        repository, candidates=[candidate], additional_trees=[leaf]
+    )
+
+    preview = repository.git_up("--dry-run")
+
+    assert preview.returncode == 0, preview.output
+    assert f"Would remove worktree {candidate.path}." in preview.output
+    assert (
+        snapshot_repository(repository, candidates=[candidate], additional_trees=[leaf])
+        == before
+    )
 
     result = repository.git_up()
 
-    assert result.returncode == 0
-    assert_path_is_present(candidate.path)
-    assert candidate.current_branch() == "ignored"
-    assert "ignored" in repository.branch_names()
-    assert submodule.path.joinpath("ignored-inside-submodule.txt").read_text() == (
-        "keep ignored submodule bytes\n"
+    assert result.returncode == 0, result.output
+    assert_path_is_absent(candidate.path)
+    assert "ignored" not in repository.branch_names()
+    assert str(candidate.path) not in repository.worktree_porcelain()
+
+
+def _candidate_with_ignored_content(
+    git_sandbox: GitSandbox, *, detached: bool, submodule_depth: int
+) -> tuple[GitRepository, GitRepository, GitRepository]:
+    repository, _remote = _remote_with_primary(git_sandbox)
+    source = repository
+    # Build the submodule chain from the inside out.
+    for depth in range(submodule_depth):
+        nested = source
+        source = git_sandbox.make_submodule(f"source-{depth}")
+        source.write(".gitignore", "cache/\n")
+        source.commit("ignore build output", relative_path=".gitignore")
+        if depth:
+            git_sandbox.initialise_submodule(source, nested)
+    if submodule_depth:
+        git_sandbox.initialise_submodule(repository, source)
+    repository.write(".gitignore", "cache/\n")
+    repository.commit("ignore build output", relative_path=".gitignore")
+    repository.run("push", "origin", "HEAD:main")
+    candidate = (
+        git_sandbox.detached_worktree(repository, "ignored")
+        if detached
+        else git_sandbox.linked_worktree(repository, "ignored", "ignored")
     )
-    assert (submodule.path / ".git").read_bytes() == submodule_git_link
-    assert f"Retained worktree {candidate.path}: dirty." in result.output
+    candidate.run(
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "update",
+        "--init",
+        "--recursive",
+    )
+    tree = candidate
+    tree.write("cache/output.txt", "disposable root build output\n")
+    for _ in range(submodule_depth):
+        tree = GitRepository(tree.path / "vendor/submodule", tree.env)
+        tree.write("cache/output.txt", "disposable submodule build output\n")
+    return repository, candidate, tree
+
+
+@pytest.mark.parametrize("detached", [False, True])
+@pytest.mark.parametrize("submodule_depth", [0, 1, 2])
+@pytest.mark.parametrize("dirt", ["tracked", "untracked"])
+def test_nonignored_changes_prevent_removal_despite_ignored_content(
+    git_sandbox: GitSandbox, detached: bool, submodule_depth: int, dirt: str
+) -> None:
+    repository, candidate, leaf = _candidate_with_ignored_content(
+        git_sandbox, detached=detached, submodule_depth=submodule_depth
+    )
+    relative_path = "README.md" if dirt == "tracked" else "notes.txt"
+    leaf.write(relative_path, "keep this work\n")
+    # Even user-configured submodule suppression must not hide ordinary dirt.
+    candidate.run("config", "status.showUntrackedFiles", "no")
+    if submodule_depth:
+        candidate.run("config", "submodule.vendor/submodule.ignore", "all")
+
+    preview = repository.git_up("--dry-run")
+    result = repository.git_up()
+
+    assert preview.returncode == result.returncode == 0, result.output
+    for output in (preview.output, result.output):
+        assert f"Retained worktree {candidate.path}: dirty." in output
+    assert leaf.path.joinpath(relative_path).read_text() == "keep this work\n"
+    assert candidate.path.joinpath("cache/output.txt").exists()
+    if not detached:
+        assert "ignored" in repository.branch_names()
+
+
+@pytest.mark.parametrize("detached", [False, True])
+@pytest.mark.parametrize("reason", ["locked", "unmerged"])
+def test_ignored_content_does_not_override_lock_or_unmerged_history(
+    git_sandbox: GitSandbox, detached: bool, reason: str
+) -> None:
+    repository, candidate, _leaf = _candidate_with_ignored_content(
+        git_sandbox, detached=detached, submodule_depth=0
+    )
+    if reason == "locked":
+        candidate.run("worktree", "lock", str(candidate.path))
+    else:
+        candidate.write("README.md", "not in the remote target\n")
+        candidate.commit("unmerged work")
+    head = candidate.head()
+
+    preview = repository.git_up("--dry-run")
+    result = repository.git_up()
+
+    assert preview.returncode == result.returncode == 0, result.output
+    for output in (preview.output, result.output):
+        assert f"Retained worktree {candidate.path}: {reason}." in output
+    assert candidate.head() == head
+    assert candidate.path.joinpath("cache/output.txt").exists()
+    if not detached:
+        assert "ignored" in repository.branch_names()
+
+
+@pytest.mark.parametrize("detached", [False, True])
+@pytest.mark.parametrize("change", ["tracked", "untracked", "head", "locked"])
+def test_final_recheck_preserves_changed_candidate_with_ignored_content(
+    git_sandbox: GitSandbox,
+    monkeypatch: pytest.MonkeyPatch,
+    detached: bool,
+    change: str,
+) -> None:
+    repository, candidate, leaf = _candidate_with_ignored_content(
+        git_sandbox, detached=detached, submodule_depth=2
+    )
+    for key, value in git_sandbox.env.items():
+        monkeypatch.setenv(key, value)
+
+    class ChangingGit(SubprocessGit):
+        lists = 0
+
+        def run(
+            self,
+            args: Sequence[str],
+            *,
+            cwd: Path | None = None,
+            check: bool = True,
+            read_only: bool = False,
+        ) -> CommandResult:
+            if list(args) == ["worktree", "list", "--porcelain", "-z"]:
+                self.lists += 1
+                if self.lists == 2:
+                    if change == "locked":
+                        candidate.run("worktree", "lock", str(candidate.path))
+                    elif change == "head":
+                        candidate.write("README.md", "new commit during cleanup\n")
+                        candidate.commit("late unmerged work")
+                    else:
+                        relative = "README.md" if change == "tracked" else "notes.txt"
+                        leaf.write(relative, "late work in nested submodule\n")
+            return super().run(args, cwd=cwd, check=check, read_only=read_only)
+
+    output = StringIO()
+    code = GitUp(git=ChangingGit(), cwd=repository.path, stdout=output).run()
+
+    assert code == 0, output.getvalue()
+    assert "final recheck" in output.getvalue()
+    assert candidate.path.joinpath("cache/output.txt").exists()
+    if change in {"tracked", "untracked"}:
+        relative = "README.md" if change == "tracked" else "notes.txt"
+        assert (
+            leaf.path.joinpath(relative).read_text()
+            == "late work in nested submodule\n"
+        )
+    if not detached:
+        assert "ignored" in repository.branch_names()
 
 
 def test_uninspectable_linked_worktree_is_retained_with_useful_reason(
@@ -247,7 +405,7 @@ def test_mixed_worktree_set_removes_only_eligible_clean_branch(
     assert_path_is_present(untracked.path)
     assert_path_is_present(locked.path)
     assert_path_is_present(unmerged.path)
-    assert_path_is_present(detached.path)
+    assert_path_is_absent(detached.path)
     assert "clean" not in repository.branch_names()
     assert {
         "tracked",
